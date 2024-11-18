@@ -5,6 +5,7 @@ from model_persistence import load_recommendation_model
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+from product_recommender import ProductRecommender
 
 class StreamlitRecommenderApp:
     def __init__(self, model_path):
