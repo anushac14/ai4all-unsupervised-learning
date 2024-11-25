@@ -1,44 +1,16 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.impute import SimpleImputer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
 from scipy.sparse import hstack, csr_matrix
-import numpy as np
-from scipy.sparse import csr_matrix
 
+df = pd.read_csv('data.csv')  # Load your actual dataset here
 
-# Import your custom classes and functions (assuming they are in another file, or you can include them directly here)
-class ProductRecommender:
-    def __init__(self, df, feature_matrix, cluster_labels):
-        self.df = df
-        self.feature_matrix = feature_matrix
-        self.cluster_labels = cluster_labels
-
-    def find_similar_products(self, product_name):
-        # Find the product in the dataframe
-        product_index = self.df[self.df['Product Name'].str.contains(product_name, case=False)].index
-        if len(product_index) == 0:
-            raise ValueError(f"Product '{product_name}' not found in the dataset.")
-        
-        # Get the feature vector for the product
-        product_feature_vector = self.feature_matrix[product_index[0]]
-
-        # Compute the similarity with all other products
-        similarities = cosine_similarity(self.feature_matrix, product_feature_vector).flatten()
-
-        # Add similarities to the dataframe
-        self.df['Similarity'] = similarities
-        
-        # Sort by similarity and return top N recommendations (e.g., 5)
-        top_recommendations = self.df.sort_values(by='Similarity', ascending=False).head(5)
-        return top_recommendations
-
-
-
-# Preprocess and helper functions
 def to_ounces(weight):
     if pd.isna(weight):
         return np.nan
@@ -58,23 +30,28 @@ def preprocess_data(df):
                       'Product Specification', 'Technical Details',
                       'Shipping Weight', 'Is Amazon Seller']].copy()
 
+    # Clean Selling Price
     processed_df['Selling Price'] = pd.to_numeric(
         processed_df['Selling Price'].astype('str').str.replace(r'[^\d.]', '', regex=True),
         errors='coerce'
     )
 
+    # Clean Shipping Weight
     processed_df['Shipping Weight'] = processed_df['Shipping Weight'].apply(to_ounces)
 
+    # Impute numerical values
     imputer = SimpleImputer(strategy='median')
     processed_df['Selling Price'] = imputer.fit_transform(processed_df[['Selling Price']])
     processed_df['Shipping Weight'] = imputer.fit_transform(processed_df[['Shipping Weight']])
 
+    # Handle text fields
     processed_df['Technical Details'] = processed_df['Technical Details'].fillna('No detail available')
     processed_df = processed_df.dropna(subset=['Category', 'Product Specification'])
 
+    # Create combined text field
     processed_df['combined'] = (processed_df['Product Specification'] + " " +
-                                processed_df['Technical Details'] + " " +
-                                processed_df['Category'])
+                              processed_df['Technical Details'] + " " +
+                              processed_df['Category'])
 
     return processed_df.reset_index(drop=True)
 
@@ -86,51 +63,100 @@ def create_feature_matrix(processed_df, max_features=10000, ngram_range=(1, 2)):
     )
     tfidf_matrix = tfidf.fit_transform(processed_df['combined'])
 
+    # Scale numerical features
     scaler = MinMaxScaler()
     numeric_features = scaler.fit_transform(
         processed_df[['Selling Price', 'Shipping Weight']]
     )
 
-    # Use hstack to combine tfidf and numeric features
-    feature_matrix = hstack([tfidf_matrix, numeric_features])
+    return hstack([tfidf_matrix, numeric_features])
 
-    # Convert the sparse matrix to csr_matrix for efficient row indexing
-    return csr_matrix(feature_matrix)
+class ProductRecommender:
+    def __init__(self, df, feature_matrix, cluster_labels):
+        self.df = df.copy()
+        self.feature_matrix = csr_matrix(feature_matrix)
+        self.df['cluster'] = cluster_labels
+
+        # Normalize product names
+        self.df['Product Name'] = self.df['Product Name'].str.strip().str.lower()
+
+        # Create product name to index mapping
+        self.product_to_idx = dict(zip(self.df['Product Name'], self.df.index))
+
+    def find_similar_products(self, product_name: str, n_recommendations: int = 10) -> pd.DataFrame:
+        try:
+            # Normalize input product name
+            product_name = product_name.strip().lower()
+
+            # Check if product exists
+            if product_name not in self.product_to_idx:
+                raise ValueError(f"Product '{product_name}' not found in the dataset.")
+
+            # Get product index and cluster
+            idx = self.product_to_idx[product_name]
+            product_cluster = self.df.loc[idx, 'cluster']
+
+            # Filter products in the same cluster
+            cluster_mask = self.df['cluster'] == product_cluster
+            cluster_indices = self.df[cluster_mask].index
+
+            # Calculate similarity scores
+            product_features = self.feature_matrix[idx]
+            cluster_features = self.feature_matrix[cluster_indices]
+            sim_scores = cosine_similarity(product_features, cluster_features).flatten()
+
+            # Create recommendations dataframe
+            recommendations = pd.DataFrame({
+                'Product Name': self.df.loc[cluster_indices, 'Product Name'],
+                'Category': self.df.loc[cluster_indices, 'Category'],
+                'Selling Price': self.df.loc[cluster_indices, 'Selling Price'],
+                'Similarity': sim_scores,
+                'Cluster': product_cluster
+            })
+
+            recommendations = (recommendations[recommendations.index != idx]
+                            .sort_values('Similarity', ascending=False)
+                            .head(n_recommendations)
+                            .round({'Similarity': 3}))
+
+            return recommendations
+
+        except Exception as e:
+            raise Exception(f"Error generating recommendations: {str(e)}")
 
 def create_recommender(df, feature_matrix, n_clusters=5):
     kmeans = KMeans(n_clusters=n_clusters, random_state=42)
     cluster_labels = kmeans.fit_predict(feature_matrix)
     return ProductRecommender(df, feature_matrix, cluster_labels)
 
-# Streamlit app
-def main():
-    st.title("Product Recommender")
+# Main App
+st.title('Product Recommendation System')
 
-    # Load the data
-    df = pd.read_csv('data.csv')
+# Preprocess the data
+processed_df = preprocess_data(df)
 
-    # Preprocess the data
-    processed_df = preprocess_data(df)
+# Create feature matrix
+feature_matrix = create_feature_matrix(processed_df)
 
-    # Create feature matrix
-    feature_matrix = create_feature_matrix(processed_df)
+# Initialize recommender
+recommender = create_recommender(processed_df, feature_matrix)
 
-    # Create the recommender system
-    recommender = create_recommender(processed_df, feature_matrix)
+# User input for product search
+product_name = st.text_input('Enter the product name:')
+n_recommendations = st.slider('Number of recommendations', 1, 20, 5)
 
-    # User input for product search
-    product_name = st.text_input("Enter a product name:")
+# Button to trigger recommendations
+if st.button('Get Recommendations'):
+    if product_name:
+        try:
+            # Get recommendations
+            recommendations = recommender.find_similar_products(product_name, n_recommendations)
+            
+            # Display the recommendations
+            st.write(f"Recommendations for: **{product_name}**")
+            st.write(recommendations[['Product Name', 'Category', 'Selling Price', 'Similarity']])
 
-    if st.button("Recommend Products"):
-        if product_name:
-            try:
-                recommendations = recommender.find_similar_products(product_name)
-                st.write(f"Top recommendations for '{product_name}':")
-                st.dataframe(recommendations[['Product Name', 'Category', 'Selling Price', 'Similarity']])
-            except ValueError as e:
-                st.error(e)
-        else:
-            st.warning("Please enter a product name.")
-
-if __name__ == "__main__":
-    main()
+        except ValueError as e:
+            st.error(str(e))
+    else:
+        st.error('Please enter a valid product name.')
